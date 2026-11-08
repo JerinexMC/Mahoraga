@@ -1,0 +1,14 @@
+name: Mahoraga
+version: 1.0.0
+main: com.mahoraga.MahoragaPlugin
+api-version: '1.21.11'
+author: ChatGPT
+description: WARA WARA Mahoraga summoning ritual.
+commands:
+  mahoraga:
+    description: Mahoraga plugin administration.
+    usage: /mahoraga cooldown <seconds>
+permissions:
+  mahoraga.admin:
+    description: Allows changing Mahoraga settings.
+    default: op

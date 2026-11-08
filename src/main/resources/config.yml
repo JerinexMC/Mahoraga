@@ -1,0 +1,14 @@
+# Default ability cooldown in seconds.
+cooldown-seconds: 1
+
+# Radius around the summoner affected by the ritual.
+freeze-radius: 15
+sculk-radius: 15
+
+# Set false to disable terrain changes.
+sculk-spread: true
+
+# These players can summon even when they are not operators.
+extra-allowed-players:
+  - CasualUser
+  - Jerinex
