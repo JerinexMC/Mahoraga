@@ -47,6 +47,8 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
     private final Map<UUID, Long> cooldowns = new HashMap<>();
     private final Map<UUID, FrozenState> frozen = new HashMap<>();
     private final Set<UUID> ritualsInProgress = new HashSet<>();
+    private final Map<UUID, Long> specialMoveCooldowns = new HashMap<>();
+    private final Map<UUID, Boolean> specialMoveFrozenAi = new HashMap<>();
     private NamespacedKey ownerKey;
     private int cooldownSeconds;
     private int freezeRadius;
@@ -60,6 +62,8 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
         ownerKey = new NamespacedKey(this, "mahoraga_owner");
         loadSettings();
         Bukkit.getPluginManager().registerEvents(this, this);
+        // Keep Mahoraga's base Warden stats untouched; only its combat behavior is customized.
+        Bukkit.getScheduler().runTaskTimer(this, this::tickMahoragas, 10L, 10L);
         getLogger().info("Mahoraga ritual plugin enabled.");
     }
 
@@ -70,6 +74,12 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
             if (entity != null) unfreeze(entity);
         }
         frozen.clear();
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntities()) {
+                if (entity instanceof Mob mob) restoreSpecialMoveTarget(mob);
+            }
+        }
+        specialMoveCooldowns.clear();
         ritualsInProgress.clear();
     }
 
@@ -198,8 +208,14 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onMahoragaTarget(EntityTargetLivingEntityEvent event) {
         if (!(event.getEntity() instanceof Warden warden) || event.getTarget() == null) return;
-        String owner = warden.getPersistentDataContainer().get(ownerKey, PersistentDataType.STRING);
-        if (owner != null && owner.equals(event.getTarget().getUniqueId().toString())) event.setCancelled(true);
+        if (isMahoraga(warden)) {
+            // Mahoraga never attacks players, including its summoner.
+            if (event.getTarget() instanceof Player) event.setCancelled(true);
+            return;
+        }
+
+        // Nearby vanilla Wardens become hostile toward Mahoraga.
+        if (event.getTarget() instanceof LivingEntity target && isMahoraga(target)) return;
     }
 
     // A Warden's sonic boom can damage its summoner even when it is not targeting them.
@@ -324,12 +340,8 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
             warden.setCustomName(ChatColor.DARK_PURPLE + "✦ " + ChatColor.LIGHT_PURPLE + ChatColor.BOLD + "MAHORAGA" + ChatColor.DARK_PURPLE + " ✦");
             warden.setCustomNameVisible(true);
             warden.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, summoner.getUniqueId().toString());
-            setAttribute(warden, Attribute.MAX_HEALTH, 500.0);
-            warden.setHealth(500.0);
-            setAttribute(warden, Attribute.ATTACK_DAMAGE, 50.0);
-            setAttribute(warden, Attribute.MOVEMENT_SPEED, 0.42);
-            setAttribute(warden, Attribute.KNOCKBACK_RESISTANCE, 1.0);
-            setAttribute(warden, Attribute.ARMOR, 20.0);
+            // Intentionally do not modify MAX_HEALTH, ATTACK_DAMAGE, SPEED,
+            // ARMOR, or KNOCKBACK_RESISTANCE. This is a normal Warden stat-wise.
 
             for (Player player : center.getWorld().getPlayers()) {
                 if (player.getLocation().distanceSquared(center) <= 40 * 40) {
@@ -384,6 +396,156 @@ public final class MahoragaPlugin extends JavaPlugin implements Listener {
             if (entity != null) unfreeze(entity);
             else frozen.remove(id);
         }
+    }
+
+
+    private boolean isMahoraga(Entity entity) {
+        return entity instanceof Warden
+                && entity.getPersistentDataContainer().has(ownerKey, PersistentDataType.STRING);
+    }
+
+    /**
+     * Mahoraga hunts mobs only. Withers and other Wardens are preferred targets.
+     * It never selects players, even if a player attacks it.
+     */
+    private void tickMahoragas() {
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntities()) {
+                if (!(entity instanceof Warden mahoraga) || !isMahoraga(mahoraga)
+                        || mahoraga.isDead() || !mahoraga.isValid()) continue;
+
+                // Nearby ordinary Wardens become hostile toward Mahoraga.
+                for (Entity nearby : mahoraga.getNearbyEntities(32.0, 16.0, 32.0)) {
+                    if (nearby instanceof Warden other && other != mahoraga && !isMahoraga(other)
+                            && other.isValid() && !other.isDead()) {
+                        other.setTarget(mahoraga);
+                    }
+                }
+
+                LivingEntity current = mahoraga.getTarget();
+                if (current instanceof Player || (current != null && (!current.isValid() || current.isDead()))) {
+                    mahoraga.setTarget(null);
+                    current = null;
+                }
+
+                if (current == null || !isValidMobTarget(current)) {
+                    LivingEntity next = findMobTarget(mahoraga, 32.0);
+                    if (next != null) mahoraga.setTarget(next);
+                }
+
+                LivingEntity target = mahoraga.getTarget();
+                if (target != null && isValidMobTarget(target)) {
+                    long readyAt = specialMoveCooldowns.getOrDefault(mahoraga.getUniqueId(), 0L);
+                    if (System.currentTimeMillis() >= readyAt && mahoraga.getLocation().distanceSquared(target.getLocation()) <= 18.0 * 18.0) {
+                        specialMoveCooldowns.put(mahoraga.getUniqueId(), System.currentTimeMillis() + 12000L);
+                        startSpecialMove(mahoraga, target);
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean isValidMobTarget(LivingEntity target) {
+        return target instanceof Mob && !(target instanceof Player)
+                && target.isValid() && !target.isDead();
+    }
+
+    private LivingEntity findMobTarget(Warden mahoraga, double radius) {
+        LivingEntity best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (Entity entity : mahoraga.getNearbyEntities(radius, radius, radius)) {
+            if (!(entity instanceof LivingEntity living) || !isValidMobTarget(living) || living == mahoraga) continue;
+            double distance = mahoraga.getLocation().distanceSquared(living.getLocation());
+            // Lower score wins: Wardens first, then Withers, then other mobs.
+            double priority = living instanceof Warden ? 0.0
+                    : living.getType() == EntityType.WITHER ? 1.0 : 2.0;
+            double score = priority * 10000.0 + distance;
+            if (score < bestScore) {
+                bestScore = score;
+                best = living;
+            }
+        }
+        return best;
+    }
+
+    private void startSpecialMove(Warden mahoraga, LivingEntity target) {
+        if (!isValidMobTarget(target) || !mahoraga.isValid()) return;
+
+        Mob frozenMob = (Mob) target;
+        boolean oldAi = frozenMob.hasAI();
+        specialMoveFrozenAi.put(frozenMob.getUniqueId(), oldAi);
+        frozenMob.setAI(false);
+        frozenMob.setVelocity(new Vector(0, 0, 0));
+        Location anchor = target.getLocation().clone();
+        World world = target.getWorld();
+
+        // Freeze for two seconds, then Mahoraga performs four rapid reposition-and-strike hits.
+        new BukkitRunnable() {
+            private int step = 0;
+
+            @Override
+            public void run() {
+                if (!mahoraga.isValid() || mahoraga.isDead()
+                        || !target.isValid() || target.isDead()
+                        || !mahoraga.getWorld().equals(world) || !target.getWorld().equals(world)) {
+                    restoreSpecialMoveTarget(frozenMob);
+                    cancel();
+                    return;
+                }
+
+                if (step < 40) {
+                    target.teleport(anchor);
+                    target.setVelocity(new Vector(0, 0, 0));
+                    step++;
+                    return;
+                }
+
+                int strike = step - 40;
+                if (strike >= 4) {
+                    restoreSpecialMoveTarget(frozenMob);
+                    mahoraga.setTarget(target);
+                    cancel();
+                    return;
+                }
+
+                // Relative to the target's facing: left, right, behind, then in front.
+                Vector forward = anchor.getDirection().setY(0);
+                if (forward.lengthSquared() < 0.001) forward = new Vector(0, 0, 1);
+                forward.normalize();
+                Vector right = new Vector(-forward.getZ(), 0, forward.getX());
+                Vector offset = switch (strike) {
+                    case 0 -> right.clone().multiply(-1.4);
+                    case 1 -> right.clone().multiply(1.4);
+                    case 2 -> forward.clone().multiply(-1.4);
+                    default -> forward.clone().multiply(1.4);
+                };
+
+                Location attackPosition = anchor.clone().add(offset);
+                attackPosition.setY(anchor.getY());
+                attackPosition.setDirection(anchor.toVector().subtract(attackPosition.toVector()));
+                mahoraga.teleport(attackPosition);
+                mahoraga.swingMainHand();
+
+                // Use the Warden's untouched vanilla attack-damage attribute.
+                AttributeInstance damage = mahoraga.getAttribute(Attribute.ATTACK_DAMAGE);
+                double vanillaDamage = damage == null ? 30.0 : damage.getValue();
+                target.damage(vanillaDamage, mahoraga);
+
+                world.spawnParticle(org.bukkit.Particle.SWEEP_ATTACK,
+                        target.getLocation().add(0, 1, 0), 3, 0.45, 0.45, 0.45, 0.0);
+                world.playSound(target.getLocation(), Sound.ENTITY_PLAYER_ATTACK_SWEEP, 1.0f, 0.65f);
+
+                // Keep the target rooted for the full two-second special-move window.
+                target.teleport(anchor);
+                target.setVelocity(new Vector(0, 0, 0));
+                step++;
+            }
+        }.runTaskTimer(this, 0L, 1L);
+    }
+
+    private void restoreSpecialMoveTarget(Mob mob) {
+        Boolean previousAi = specialMoveFrozenAi.remove(mob.getUniqueId());
+        if (previousAi != null && mob.isValid() && !mob.isDead()) mob.setAI(previousAi);
     }
 
     private boolean isNaturalGround(Material material) {
